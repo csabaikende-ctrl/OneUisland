@@ -535,13 +535,14 @@ final class OaSource {
             // Pause / +1 min buttons) instead of the app's bare RemoteViews layout.
             it.remoteView = null;
             if (!notEmpty(it.title)) it.title = clockLabel(n);
-            if (!notEmpty(it.title)) it.title = it.appName;
+            if (!notEmpty(it.title)) it.title = isStopwatch(n) ? "Stopwatch" : it.appName;
             if (it.trailing != IslandItem.Trailing.CHRONOMETER) {
                 // paused: the layout shows the frozen time as plain text
                 String frozen = clockTime(n);
                 if (frozen != null) {
                     it.trailing = IslandItem.Trailing.TEXT;
                     it.trailingText = frozen;
+                    if (isStopwatch(n)) it.pausedMs = pausedStopwatchMs(itemKey, sbn, frozen);
                 }
             }
             it.subtitle = null;
@@ -803,6 +804,33 @@ final class OaSource {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /**
+     * A paused stopwatch has to read like the running one (with hundredths), but the app's paused
+     * layout only shows whole seconds. The exact value is the pause moment (the update's post time)
+     * minus the start remembered while it ran; it's used when it agrees with the app's seconds,
+     * otherwise the app's value is used.
+     */
+    private long pausedStopwatchMs(String itemKey, StatusBarNotification sbn, String frozen) {
+        long shown = parseClockMs(frozen);
+        if (shown < 0) return -1;
+        Long base = stopwatchBases.get(itemKey);
+        if (base != null && sbn != null) {
+            long exact = sbn.getPostTime() - base;
+            if (exact >= shown - 50 && exact < shown + 1050) return Math.max(shown, exact);
+        }
+        return shown;
+    }
+
+    /** "12:34" or "1:02:03" -> milliseconds; -1 if it isn't a plain duration. */
+    static long parseClockMs(String s) {
+        if (s == null) return -1;
+        String t = s.trim();
+        if (t.startsWith("-") || !t.matches("[0-9]+(:[0-9]{2}){1,2}")) return -1;
+        long total = 0;
+        for (String part : t.split(":")) total = total * 60 + Long.parseLong(part);
+        return total * 1000;
     }
 
     private String clockTime(Notification n) {
