@@ -72,11 +72,46 @@ public final class SettingsActivity extends Activity {
                 Settings.DEF_MAX_CHARS, v -> v >= Settings.NO_MAX_CHARS ? "No limit" : v + " chars", Settings.PREVIEW_LENGTH);
         link(island, "Island position", this::positionSummary, () ->
                 startActivity(new Intent(this, SettingsActivity.class).putExtra(EXTRA_SCREEN, SCREEN_POSITION)));
+        slider(island, "Vertical position", Settings.OFFSET_Y, Settings.MIN_OFFSET_Y, Settings.MAX_OFFSET_Y,
+                Settings.DEF_OFFSET_Y, v -> (v > 0 ? "+" : "") + v + " dp", Settings.PREVIEW_ALIGN);
         toggle(island, "Detailed second capsule", Settings.DETAILED_BUBBLE, Settings.DEF_DETAILED_BUBBLE);
+        toggle(island, "Notifications in island (with reply)", Settings.NOTIF_ISLAND, Settings.DEF_NOTIF_ISLAND);
+        link(island, "Send test notification", () -> "", () -> {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
+                return;
+            }
+            TestNotification.post(this, null);
+        });
 
         gap(root);
         LinearLayout cards = group(root, "Cards");
-        toggle(cards, "Frosted glass design", Settings.FROSTED_CARDS, Settings.DEF_FROSTED_CARDS);
+        Switch frosted = toggle(cards, "Frosted glass design", Settings.FROSTED_CARDS, Settings.DEF_FROSTED_CARDS);
+        Switch liquid = toggle(cards, "Liquid glass design", Settings.LIQUID_GLASS, Settings.DEF_LIQUID_GLASS);
+        // The two designs are alternatives: switching one on switches the other off.
+        frosted.setOnCheckedChangeListener((b, on) -> {
+            SharedPreferences.Editor e = prefs.edit().putBoolean(Settings.FROSTED_CARDS, on);
+            if (on) e.putBoolean(Settings.LIQUID_GLASS, false);
+            e.apply();
+            refresh();
+        });
+        liquid.setOnCheckedChangeListener((b, on) -> {
+            SharedPreferences.Editor e = prefs.edit().putBoolean(Settings.LIQUID_GLASS, on);
+            if (on) e.putBoolean(Settings.FROSTED_CARDS, false);
+            e.apply();
+            refresh();
+        });
+        LinearLayout liquidOptions = new LinearLayout(this);
+        liquidOptions.setOrientation(LinearLayout.VERTICAL);
+        liquidOptions.setPadding(dp(12), 0, 0, dp(4));
+        cards.addView(liquidOptions);
+        slider(liquidOptions, "Glass blur", Settings.LIQUID_BLUR, Settings.MIN_LIQUID_BLUR, Settings.MAX_LIQUID_BLUR,
+                Settings.DEF_LIQUID_BLUR, String::valueOf, null);
+        slider(liquidOptions, "Edge thickness", Settings.LIQUID_EDGE, Settings.MIN_LIQUID_EDGE, Settings.MAX_LIQUID_EDGE,
+                Settings.DEF_LIQUID_EDGE, v -> v + " dp", null);
+        toggle(liquidOptions, "Chromatic edges", Settings.LIQUID_CHROMA, Settings.DEF_LIQUID_CHROMA);
+        refreshers.add(() -> liquidOptions.setVisibility(
+                prefs.getBoolean(Settings.LIQUID_GLASS, Settings.DEF_LIQUID_GLASS) ? View.VISIBLE : View.GONE));
         toggle(cards, "Recent Spotify playlists", Settings.SPOTIFY_RECENTS, Settings.DEF_SPOTIFY_RECENTS);
 
         gap(root);
@@ -257,7 +292,10 @@ public final class SettingsActivity extends Activity {
     }
 
     private static final long PREVIEW_HOLD_MS = 1200;
-    private final Runnable endPreview = () -> prefs.edit().putBoolean(Settings.PREVIEW_LENGTH, false).apply();
+    private final Runnable endPreview = () -> prefs.edit()
+            .putBoolean(Settings.PREVIEW_LENGTH, false)
+            .putBoolean(Settings.PREVIEW_ALIGN, false)
+            .apply();
 
     @Override
     protected void onPause() {

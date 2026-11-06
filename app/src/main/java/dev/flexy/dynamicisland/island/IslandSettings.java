@@ -25,6 +25,10 @@ final class IslandSettings {
         return values.getBoolean(Settings.PREVIEW_LENGTH, false);
     }
 
+    static boolean previewAlign() {
+        return values.getBoolean(Settings.PREVIEW_ALIGN, false);
+    }
+
     static boolean alertBattery() {
         return values.getBoolean(Settings.ALERT_BATTERY, Settings.DEF_ALERT_BATTERY);
     }
@@ -51,8 +55,17 @@ final class IslandSettings {
         return v >= Settings.POS_CENTER && v <= max ? v : Settings.DEF_POSITION;
     }
 
+    static int offsetYDp() {
+        int v = values.getInt(Settings.OFFSET_Y, Settings.DEF_OFFSET_Y);
+        return Math.max(Settings.MIN_OFFSET_Y, Math.min(Settings.MAX_OFFSET_Y, v));
+    }
+
     static boolean glassPill(boolean large) {
         return values.getBoolean(large ? Settings.GLASS_PILL : Settings.GLASS_PILL_PHONE, Settings.DEF_GLASS_PILL);
+    }
+
+    static boolean notifIsland() {
+        return values.getBoolean(Settings.NOTIF_ISLAND, Settings.DEF_NOTIF_ISLAND);
     }
 
     static boolean detailedBubble() {
@@ -61,6 +74,24 @@ final class IslandSettings {
 
     static boolean frostedCards() {
         return values.getBoolean(Settings.FROSTED_CARDS, Settings.DEF_FROSTED_CARDS);
+    }
+
+    static boolean liquidGlass() {
+        return values.getBoolean(Settings.LIQUID_GLASS, Settings.DEF_LIQUID_GLASS);
+    }
+
+    static int liquidBlur() {
+        int v = values.getInt(Settings.LIQUID_BLUR, Settings.DEF_LIQUID_BLUR);
+        return Math.max(Settings.MIN_LIQUID_BLUR, Math.min(Settings.MAX_LIQUID_BLUR, v));
+    }
+
+    static int liquidEdgeDp() {
+        int v = values.getInt(Settings.LIQUID_EDGE, Settings.DEF_LIQUID_EDGE);
+        return Math.max(Settings.MIN_LIQUID_EDGE, Math.min(Settings.MAX_LIQUID_EDGE, v));
+    }
+
+    static boolean liquidChroma() {
+        return values.getBoolean(Settings.LIQUID_CHROMA, Settings.DEF_LIQUID_CHROMA);
     }
 
     static boolean spotifyRecents() {

@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_launcher"
@@ -33,5 +35,8 @@
                 <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
             </intent-filter>
         </activity>
+        <receiver
+            android:name=".TestNotification$Receiver"
+            android:exported="false" />
     </application>
 </manifest>

@@ -16,7 +16,8 @@ public final class IslandItem {
         TIMER(70),
         LIVE(60),
         MEDIA(50),
-        CHARGING(40);
+        CHARGING(40),
+        NOTIFICATION(30);
 
         public final int priority;
 
@@ -54,6 +55,8 @@ public final class IslandItem {
         public final boolean destructive;
         public int glyph;
         public boolean active;
+        /** Drawn as the card's main (accent) button, e.g. Reply. */
+        public boolean emphasized;
 
         public Action(CharSequence title, Drawable icon, PendingIntent intent, Runnable runnable, boolean destructive) {
             this.title = title;
@@ -153,6 +156,12 @@ public final class IslandItem {
     public boolean iconRight;
     public Runnable trailingTap;
     public boolean noExpand;
+    /** A regular notification shown by the island instead of a heads-up. */
+    public boolean notification;
+    /** StatusBarNotification key of {@link #notification} items. */
+    public String notificationKey;
+    /** Draw {@link #cardImage} as a circle (contact photo / large icon). */
+    public boolean cardImageRound;
     public boolean blank;
     public int ringPercent = -1;
 

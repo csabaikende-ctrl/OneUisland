@@ -35,18 +35,215 @@ final class OaSource {
     private final Map<Object, IslandItem> cache = new WeakHashMap<>();
     Object callController;
 
+    /**
+     * AOSP SystemUI's NotifCollection (LineageOS and other non-Samsung ROMs). Used instead of the
+     * One UI Now Bar data helper when {@link #HELPER} doesn't exist.
+     */
+    volatile Object notifCollection;
+    private volatile String aospForeground;
+    private final Map<Object, IslandItem> aospCache = new WeakHashMap<>();
+
     OaSource(Context ctx, ClassLoader cl) {
         this.ctx = ctx;
         this.helper = Refl.findClass(HELPER, cl);
+        if (helper == null) watchForegroundAosp(cl);
     }
 
     String foregroundPackage() {
+        if (helper == null) return aospForeground;
         Object cn = Refl.getStatic(helper, "baseActivityComponentName");
         return cn instanceof ComponentName ? ((ComponentName) cn).getPackageName() : null;
     }
 
+    /** Tracks the top task via SystemUI's TaskStackChangeListeners (AOSP). */
+    private void watchForegroundAosp(ClassLoader cl) {
+        try {
+            Class<?> listeners = Refl.findClass("com.android.systemui.shared.system.TaskStackChangeListeners", cl);
+            Class<?> listener = Refl.findClass("com.android.systemui.shared.system.TaskStackChangeListener", cl);
+            Object instance = Refl.getStatic(listeners, "INSTANCE");
+            if (instance == null || listener == null) return;
+            Object proxy = Refl.proxy(listener, (pr, m, a) -> {
+                String name = m.getName();
+                if ("onTaskStackChanged".equals(name) || "onTaskRemoved".equals(name)
+                        || "onTaskMovedToFront".equals(name)) {
+                    main.post(this::updateForegroundAosp);
+                }
+                return null;
+            });
+            Refl.call(instance, "registerTaskStackListener", proxy);
+            main.post(this::updateForegroundAosp);
+        } catch (Throwable t) {
+            XLog.e("task stack listener", t);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void updateForegroundAosp() {
+        String pkg = null;
+        try {
+            android.app.ActivityManager am = ctx.getSystemService(android.app.ActivityManager.class);
+            List<android.app.ActivityManager.RunningTaskInfo> tasks = am == null ? null : am.getRunningTasks(1);
+            if (tasks != null && !tasks.isEmpty()) {
+                android.app.ActivityManager.RunningTaskInfo t = tasks.get(0);
+                ComponentName c = t.baseActivity != null ? t.baseActivity : t.topActivity;
+                if (c != null) pkg = c.getPackageName();
+            }
+        } catch (Throwable t) {
+            XLog.e("top task", t);
+        }
+        if (java.util.Objects.equals(pkg, aospForeground)) return;
+        aospForeground = pkg;
+        Runnable r = onChanged;
+        if (r != null) r.run();
+    }
+
+    private static final int FLAG_PROMOTED_ONGOING = 0x00040000; // Notification.FLAG_PROMOTED_ONGOING (API 36)
+
+    /**
+     * AOSP equivalent of the Now Bar: calls (CallStyle) and live activities, i.e. promoted ongoing
+     * notifications plus ongoing ones that carry live state (chronometer, progress, navigation,
+     * short critical text).
+     */
+    private void collectAosp(List<IslandItem> out, Set<String> hiddenByForeground, Collection<String> packages) {
+        Object set = Refl.get(notifCollection, "mReadOnlyNotificationSet");
+        if (!(set instanceof Collection)) return;
+        String fg = aospForeground;
+        for (Object entry : new java.util.ArrayList<>((Collection<?>) set)) {
+            try {
+                Object sbnObj = Refl.get(entry, "mSbn");
+                if (!(sbnObj instanceof StatusBarNotification)) continue;
+                StatusBarNotification sbn = (StatusBarNotification) sbnObj;
+                Notification n = sbn.getNotification();
+                String pkg = sbn.getPackageName();
+                String key = sbn.getKey();
+                if (n == null || pkg == null || key == null) continue;
+                if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) continue;
+                if (n.extras.containsKey(Notification.EXTRA_MEDIA_SESSION) && !VoiceLevels.PACKAGE.equals(pkg)) continue;
+                Object ranking = Refl.get(entry, "mRanking");
+                if (ranking instanceof android.service.notification.NotificationListenerService.Ranking) {
+                    int imp = ((android.service.notification.NotificationListenerService.Ranking) ranking).getImportance();
+                    if (imp >= 0 && imp <= android.app.NotificationManager.IMPORTANCE_MIN) continue;
+                }
+                boolean call = isCallStyle(n);
+                if (!call && !isAospLive(entry, pkg, n)) continue;
+                String target = targetPackage(n.contentIntent);
+                String appPkg = target != null ? target : pkg;
+                packages.add(pkg);
+                if (target != null) packages.add(target);
+                String itemKey = (call ? "call:" : "oa:") + key;
+                if (fg != null && (fg.equals(appPkg) || fg.equals(pkg))) {
+                    hiddenByForeground.add(itemKey);
+                    continue;
+                }
+                IslandItem item = aospCache.get(sbn);
+                if (item == null) {
+                    item = call ? buildAospCall(itemKey, pkg, sbn, n) : build(itemKey, null, pkg, sbn, n, false);
+                    aospCache.put(sbn, item);
+                }
+                item.postTime = call ? Long.MAX_VALUE : sbn.getPostTime();
+                out.add(item);
+            } catch (Throwable t) {
+                XLog.e("AOSP item failed", t);
+            }
+        }
+    }
+
+    private static final Set<String> CLOCK_PACKAGES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "com.google.android.deskclock", "com.android.deskclock"));
+    private final Map<Notification, Boolean> chronoViews = new WeakHashMap<>();
+
+    /**
+     * Clock apps post timers and stopwatches as plain (not ongoing) notifications with a custom
+     * layout holding a Chronometer; those are live activities, the "upcoming alarm" ones aren't.
+     */
+    private boolean hasChronometerView(Notification n) {
+        Boolean cached = chronoViews.get(n);
+        if (cached != null) return cached;
+        boolean found = false;
+        if (n.contentView != null) {
+            try {
+                found = findChronometer(n.contentView.apply(ctx, new FrameLayout(ctx))) != null;
+            } catch (Throwable t) {
+                XLog.e("clock RemoteViews", t);
+            }
+        }
+        chronoViews.put(n, found);
+        return found;
+    }
+
+    /** Timer and stopwatch channels of clock apps ("Timers v2", "Stopwatch"); paused ones have no Chronometer. */
+    private static boolean isClockTimerChannel(Notification n) {
+        String ch = n.getChannelId();
+        if (ch == null) return false;
+        ch = ch.toLowerCase(java.util.Locale.ROOT);
+        return ch.contains("timer") || ch.contains("stopwatch");
+    }
+
+    private boolean isAospLive(Object entry, String pkg, Notification n) {
+        if ((n.flags & FLAG_PROMOTED_ONGOING) != 0) return true;
+        if (Refl.get(entry, "mPromotedNotificationContentModels") != null) return true;
+        if (CLOCK_PACKAGES.contains(pkg) && (isClockTimerChannel(n) || hasChronometerView(n))) return true;
+        if ((n.flags & Notification.FLAG_ONGOING_EVENT) == 0) return false;
+        Bundle x = n.extras;
+        if (isProgressStyle(n) || x.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)) return true;
+        if (Notification.CATEGORY_NAVIGATION.equals(n.category) || Notification.CATEGORY_STOPWATCH.equals(n.category)) return true;
+        if (x.getCharSequence("android.shortCriticalText") != null) return true;
+        return x.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0 && !x.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false);
+    }
+
+    private static final int CALL_TYPE_INCOMING = 1; // Notification.CallStyle.CALL_TYPE_INCOMING
+    private static final int CALL_TYPE_ONGOING = 2; // Notification.CallStyle.CALL_TYPE_ONGOING
+
+    private IslandItem buildAospCall(String itemKey, String pkg, StatusBarNotification sbn, Notification n) {
+        Bundle x = n.extras;
+        IslandItem it = new IslandItem(itemKey);
+        it.kind = IslandItem.Kind.CALL;
+        it.packageName = pkg;
+        it.userId = sbn.getUid() / 100_000 /* UserHandle.PER_USER_RANGE */;
+        it.accent = CALL_GREEN;
+        it.icon = load(n.getSmallIcon(), pkg);
+        it.iconIsImage = false;
+        if (it.icon == null) {
+            it.icon = appIcon(pkg);
+            it.iconIsImage = true;
+        }
+        it.appName = appLabel(pkg);
+        CharSequence caller = x.getCharSequence(Notification.EXTRA_TITLE);
+        android.app.Person person = x.getParcelable(Notification.EXTRA_CALL_PERSON, android.app.Person.class);
+        if (!notEmpty(caller) && person != null) caller = person.getName();
+        it.title = notEmpty(caller) ? caller : it.appName;
+        CharSequence text = x.getCharSequence(Notification.EXTRA_TEXT);
+        it.subtitle = notEmpty(text) ? text : it.appName;
+        Drawable image = n.getLargeIcon() != null ? load(n.getLargeIcon(), pkg) : null;
+        if (image == null && person != null && person.getIcon() != null) image = load(person.getIcon(), pkg);
+        it.cardImage = image != null ? image : appIcon(pkg);
+        it.cardImageIsImage = true;
+        it.contentIntent = n.contentIntent;
+        addCallActions(it, n.actions == null ? null : java.util.Arrays.asList(n.actions), pkg);
+        boolean incoming = x.getInt(Notification.EXTRA_CALL_TYPE, 0) == CALL_TYPE_INCOMING;
+        boolean ongoingCall = x.getInt(Notification.EXTRA_CALL_TYPE, 0) == CALL_TYPE_ONGOING;
+        if (!incoming && n.when > 0 && (x.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false) || ongoingCall)) {
+            it.trailing = IslandItem.Trailing.CHRONOMETER;
+            it.chronoBase = n.when;
+            it.chronoCountDown = false;
+        }
+        return it;
+    }
+
+    private String appLabel(String pkg) {
+        try {
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            return String.valueOf(pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)));
+        } catch (Throwable t) {
+            return pkg;
+        }
+    }
+
     void collect(List<IslandItem> out, Set<String> hiddenByForeground, Collection<String> packages) {
-        if (helper == null) return;
+        if (helper == null) {
+            collectAosp(out, hiddenByForeground, packages);
+            return;
+        }
         String fg = foregroundPackage();
         Set<String> pipPackages = pipPackages();
         int order = 0;
@@ -189,7 +386,7 @@ final class OaSource {
     private IslandItem build(String itemKey, Object d, String pkg, StatusBarNotification sbn, Notification n, boolean isCall) {
         IslandItem it = new IslandItem(itemKey);
         it.packageName = pkg;
-        it.userId = Refl.getInt(d, "mUserId", 0);
+        it.userId = d == null && sbn != null ? sbn.getUid() / 100_000 /* UserHandle.PER_USER_RANGE */ : Refl.getInt(d, "mUserId", 0);
         Bundle extras = n != null ? n.extras : new Bundle();
         it.progressStyle = isProgressStyle(n);
         it.kind = isCall ? IslandItem.Kind.CALL : classify(n, pkg);
@@ -197,6 +394,7 @@ final class OaSource {
         Icon chip = (Icon) Refl.get(d, "mChipIcon");
         if (chip == null) chip = (Icon) Refl.get(d, "mCardIcon");
         it.icon = load(chip, pkg);
+        if (d == null && n != null) it.icon = load(n.getSmallIcon(), pkg); // AOSP: chip = small icon
         int bg = Refl.getInt(d, "mChipBackground", 0);
         Object cardBg = Refl.get(d, "mCardIconBg");
         int color = bg != 0 ? bg : (cardBg instanceof Integer && (Integer) cardBg != 0 ? (Integer) cardBg : (n != null ? n.color : 0));
@@ -255,7 +453,7 @@ final class OaSource {
             }
         }
 
-        it.appName = (String) Refl.get(d, "mAppName");
+        it.appName = d == null ? appLabel(pkg) : (String) Refl.get(d, "mAppName");
         String title = (String) Refl.get(d, "mNowbarPrimaryInfo");
         if (!notEmpty(title)) title = (String) Refl.get(d, "mPrimaryInfo");
         if (!notEmpty(title)) {
@@ -327,12 +525,34 @@ final class OaSource {
                     n.extras.getCharSequence(Notification.EXTRA_TITLE), n.extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
             if (detail != null && !detail.toString().equals(String.valueOf(it.subtitle))) it.detail = detail;
         }
-        it.contentIntent = (PendingIntent) Refl.get(d, "mPendingIntent");
+        it.contentIntent = d == null && n != null ? n.contentIntent : (PendingIntent) Refl.get(d, "mPendingIntent");
         RemoteViews rv = (RemoteViews) Refl.get(d, "mCustomExpandedCardView");
         if (rv == null) rv = (RemoteViews) Refl.get(d, "mNowbarExpandRemoteView");
         if (rv == null && n != null) rv = n.bigContentView != null ? n.bigContentView : n.contentView;
         it.remoteView = rv;
-        Object actions = Refl.get(d, "mActions");
+        if (d == null && CLOCK_PACKAGES.contains(pkg)) {
+            // Clock timers/stopwatches: the island's own timer card (big countdown + the app's
+            // Pause / +1 min buttons) instead of the app's bare RemoteViews layout.
+            it.remoteView = null;
+            if (!notEmpty(it.title)) it.title = clockLabel(n);
+            if (!notEmpty(it.title)) it.title = it.appName;
+            if (it.trailing != IslandItem.Trailing.CHRONOMETER) {
+                // paused: the layout shows the frozen time as plain text
+                String frozen = clockTime(n);
+                if (frozen != null) {
+                    it.trailing = IslandItem.Trailing.TEXT;
+                    it.trailingText = frozen;
+                }
+            }
+            it.subtitle = null;
+            Drawable app = appIcon(pkg);
+            if (app != null) {
+                it.cardImage = app;
+                it.cardImageIsImage = true;
+            }
+        }
+        Object actions = d == null && n != null && n.actions != null
+                ? java.util.Arrays.asList(n.actions) : Refl.get(d, "mActions");
         if (actions instanceof List) {
             for (Object o : (List<?>) actions) {
                 if (!(o instanceof Notification.Action)) continue;
@@ -394,7 +614,7 @@ final class OaSource {
             Drawable large = load((Icon) Refl.get(d, "mNowbarIcon"));
             if (large != null) it.cardImage = large;
         }
-        addCallActions(it, d, pkg);
+        addCallActions(it, d == null ? null : Refl.get(d, "mActions"), pkg);
         applyCallChronometer(it, key);
         it.postTime = Long.MAX_VALUE;
         out.add(it);
@@ -404,12 +624,11 @@ final class OaSource {
             "com.samsung.android.incallui", "com.samsung.android.dialer", "com.android.server.telecom",
             "com.android.phone", "com.google.android.dialer", "com.android.dialer", "com.android.incallui"));
 
-    private void addCallActions(IslandItem it, Object d, String pkg) {
+    private void addCallActions(IslandItem it, Object actions, String pkg) {
         PendingIntent hangIntent = null;
         Drawable hangIcon = null;
         PendingIntent speakerIntent = null;
         Notification.Action extra = null;
-        Object actions = d == null ? null : Refl.get(d, "mActions");
         if (actions instanceof List) {
             for (Object o : (List<?>) actions) {
                 if (!(o instanceof Notification.Action)) continue;
@@ -547,7 +766,8 @@ final class OaSource {
     private static boolean isStopwatch(Notification n) {
         if (n == null) return false;
         String channel = n.getChannelId();
-        return Notification.CATEGORY_STOPWATCH.equals(n.category) || (channel != null && channel.contains("stopwatch"));
+        return Notification.CATEGORY_STOPWATCH.equals(n.category)
+                || (channel != null && channel.toLowerCase(java.util.Locale.ROOT).contains("stopwatch"));
     }
 
     private CharSequence pausedChronoText;
@@ -557,7 +777,8 @@ final class OaSource {
         if (n != null && n.extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)) {
             return new long[]{n.when, n.extras.getBoolean(Notification.EXTRA_CHRONOMETER_COUNT_DOWN, false) ? 1 : 0, 1};
         }
-        RemoteViews rv = (RemoteViews) Refl.get(d, "mChronometerView");
+        RemoteViews rv = d == null && n != null && CLOCK_PACKAGES.contains(pkgOf(n))
+                ? n.contentView : (RemoteViews) Refl.get(d, "mChronometerView");
         if (rv == null) return null;
         try {
             FrameLayout parent = new FrameLayout(ctx);
@@ -572,6 +793,63 @@ final class OaSource {
             XLog.e("chronometer RemoteViews", t);
             return null;
         }
+    }
+
+    /** First non-chronometer text of a clock app's layout ("Timer", a timer's label, "Stopwatch"). */
+    private String clockLabel(Notification n) {
+        if (n == null || n.contentView == null) return null;
+        try {
+            return firstText(n.contentView.apply(ctx, new FrameLayout(ctx)));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private String clockTime(Notification n) {
+        if (n == null || n.contentView == null) return null;
+        try {
+            return firstTime(n.contentView.apply(ctx, new FrameLayout(ctx)));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String firstTime(View v) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return null;
+        if (v instanceof android.widget.TextView) {
+            CharSequence t = ((android.widget.TextView) v).getText();
+            return t != null && t.toString().trim().matches("-?[0-9]+(:[0-9]{2}){1,2}") ? t.toString().trim() : null;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                String t = firstTime(g.getChildAt(i));
+                if (t != null) return t;
+            }
+        }
+        return null;
+    }
+
+    private static String firstText(View v) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return null;
+        if (v instanceof android.widget.TextView && !(v instanceof Chronometer)) {
+            CharSequence t = ((android.widget.TextView) v).getText();
+            return notEmpty(t) && !t.toString().matches("[0-9:.\\s]+") ? t.toString() : null;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                String t = firstText(g.getChildAt(i));
+                if (t != null) return t;
+            }
+        }
+        return null;
+    }
+
+    private static String pkgOf(Notification n) {
+        android.content.pm.ApplicationInfo ai = n.extras.getParcelable("android.appInfo" /* Notification.EXTRA_BUILDER_APPLICATION_INFO */,
+                android.content.pm.ApplicationInfo.class);
+        return ai == null ? null : ai.packageName;
     }
 
     private static Chronometer findChronometer(View v) {
@@ -590,7 +868,8 @@ final class OaSource {
         String cat = n == null ? null : n.category;
         if (Notification.CATEGORY_NAVIGATION.equals(cat)) return IslandItem.Kind.NAVIGATION;
         if (Notification.CATEGORY_STOPWATCH.equals(cat) || Notification.CATEGORY_ALARM.equals(cat)
-                || "com.sec.android.app.clockpackage".equals(pkg)) {
+                || "com.sec.android.app.clockpackage".equals(pkg) || "com.android.deskclock".equals(pkg)
+                || "com.google.android.deskclock".equals(pkg)) {
             return IslandItem.Kind.TIMER;
         }
         if ("com.sec.android.app.voicenote".equals(pkg)) return IslandItem.Kind.RECORDING;

@@ -40,6 +40,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
     final CastSource cast;
     final ExitAnimationBridge exit;
     final AlertSource alerts;
+    private final NotifSource notifs;
     private final FlashlightSource torch;
     private final StatusBarIconFader fader;
     private final AudioLevels audio = new AudioLevels();
@@ -160,6 +161,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         cast = new CastSource(ctx);
         exit = new ExitAnimationBridge(cl);
         alerts = new AlertSource(ctx, this::requestRefresh);
+        notifs = new NotifSource(ctx, this::startReply);
         torch = new FlashlightSource(ctx, main, this::requestRefresh);
         fader = new StatusBarIconFader(density);
     }
@@ -180,10 +182,15 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
     public void onNotifications(List<android.service.notification.StatusBarNotification> all) {
         if (Looper.myLooper() != main.getLooper()) {
             List<android.service.notification.StatusBarNotification> copy = new ArrayList<>(all);
-            main.post(() -> alerts.onNotifications(copy));
+            main.post(() -> onNotifications(copy));
             return;
         }
         alerts.onNotifications(all);
+        if (!kept.isEmpty()) {
+            java.util.Set<String> active = new java.util.HashSet<>();
+            for (android.service.notification.StatusBarNotification sbn : all) active.add(sbn.getKey());
+            if (kept.values().removeIf(it -> !active.contains(it.notificationKey))) requestRefresh();
+        }
     }
 
     public boolean hasTorch() {
@@ -291,6 +298,12 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         requestRefresh();
     }
 
+    /** AOSP NotifCollection: source of calls and live activities on non-Samsung ROMs. */
+    public void setNotifCollection(Object collection) {
+        oa.notifCollection = collection;
+        requestRefresh();
+    }
+
     public void setCallController(Object controller) {
         oa.callController = controller;
     }
@@ -370,6 +383,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
             if (torch.available()) items.removeIf(FlashlightSource::isSystemTorchItem);
             torch.collect(items, view.isExpanded());
             addSavedRecording(items);
+            addKeptNotifications(items);
         } catch (Throwable t) {
             XLog.e("collect failed", t);
         }
@@ -439,7 +453,8 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
             if (m != null) hiddenList.add(m);
         }
         IslandItem alert = alerts.current(now, view.isExpanded());
-        if (IslandSettings.previewLength()) {
+        // alignment preview keeps the island's real shape; only an empty island gets the preview pill
+        if (IslandSettings.previewLength() || (IslandSettings.previewAlign() && items.isEmpty())) {
             view.setItems(Collections.singletonList(lengthPreview), IslandView.HINT_NONE, Collections.emptyList());
         } else if (alert != null) {
             view.setItems(Collections.singletonList(alert), IslandView.HINT_NONE, Collections.emptyList());
@@ -528,6 +543,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         boolean glass = (position == dev.flexy.dynamicisland.Settings.POS_LEFT
                 || (tablet && position == dev.flexy.dynamicisland.Settings.POS_CENTER)) && IslandSettings.glassPill(tablet);
         boolean landscape = w > h;
+        if (!landscape) cy += IslandSettings.offsetYDp() * density;
         if (landscape) cyLandscape = cy;
         else cyPortrait = cy;
         view.setGeometry(w, cx, cy, holeD, tablet, anchor, glass, limit);
@@ -661,11 +677,15 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
             view.getCoverageBounds(tmp);
             fader.update(tmp, !hidden && view.visibleAlpha() > 0.3f);
         }
-        audio.setActive(view.needsAudio());
+        audio.setActive(media.anyPlaying());
     }
 
     @Override
     public void onOpenItem(IslandItem item, RectF from) {
+        if (item.notification) {
+            reportNotificationClick(item.notificationKey);
+            forget(item);
+        }
         PendingIntent pi = item.contentIntent;
         try {
             Bundle options = launchOptions(from);
@@ -685,6 +705,11 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
 
     @Override
     public void onItemAction(IslandItem item, IslandItem.Action action) {
+        // a notification's own button (e.g. Mark as read) settles it; Reply is handled when sent
+        if (item.notification && action.runnable == null) {
+            forget(item);
+            if (view != null) view.collapse();
+        }
         try {
             if (action.runnable != null) {
                 action.runnable.run();
@@ -696,8 +721,164 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         }
     }
 
+    // ---- notifications (instead of heads-up) and inline reply ----
+
+    private static final long NOTIF_SHOW_MS = 6000;
+    private static final long NOTIF_AFTER_REPLY_MS = 1200;
+    private String lastOffered;
+    /** Notification keys the island has already alerted for (bounded). */
+    private final java.util.Set<String> alerted = java.util.Collections.newSetFromMap(
+            new java.util.LinkedHashMap<String, Boolean>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Boolean> e) {
+                    return size() > 200;
+                }
+            });
+
+    /**
+     * Called from SystemUI's heads-up decision (main thread). Returns true when the island shows
+     * the notification itself, in which case SystemUI skips the heads-up.
+     */
+    public boolean offerHeadsUp(android.service.notification.StatusBarNotification sbn) {
+        if (Looper.myLooper() != main.getLooper()) return false;
+        if (!IslandSettings.notifIsland() || window == null || view == null || sbn == null) return false;
+        String id = sbn.getKey() + "@" + sbn.getPostTime();
+        IslandItem shown = view.presentedNotification();
+        if (id.equals(lastOffered) && shown != null && sbn.getKey().equals(shown.notificationKey)) return true;
+        // "Only alert once" updates (e.g. the app adding your reply to the conversation): the island
+        // already alerted for this key. Claim it so SystemUI doesn't treat it as a first alert, show nothing.
+        if ((sbn.getNotification().flags & android.app.Notification.FLAG_ONLY_ALERT_ONCE) != 0
+                && alerted.contains(sbn.getKey())) {
+            String k = "notif:" + sbn.getKey();
+            if (kept.containsKey(k) && NotifSource.candidate(sbn)) {
+                kept.put(k, notifs.build(sbn));
+                requestRefresh();
+            }
+            return true;
+        }
+        if (!NotifSource.candidate(sbn) || !canPresent()) return false;
+        if (window.isReplying()) return false;
+        IslandItem item = notifs.build(sbn);
+        lastOffered = id;
+        alerted.add(sbn.getKey());
+        kept.put(item.key, item);
+        view.presentNotification(item, NOTIF_SHOW_MS);
+        XLog.i("notification on island: " + sbn.getKey());
+        return true;
+    }
+
+    /**
+     * Notifications the island showed and the user hasn't dealt with yet: they stay as a pill with
+     * the app's icon until replied to, acted on, opened, swiped away or removed from the shade.
+     */
+    private final java.util.LinkedHashMap<String, IslandItem> kept = new java.util.LinkedHashMap<>();
+
+    private void addKeptNotifications(List<IslandItem> out) {
+        if (kept.isEmpty()) return;
+        Object set = dev.flexy.dynamicisland.xposed.Refl.get(oa.notifCollection, "mReadOnlyNotificationSet");
+        if (set instanceof java.util.Collection) {
+            java.util.Set<String> active = new java.util.HashSet<>();
+            for (Object e : new ArrayList<>((java.util.Collection<?>) set)) {
+                Object sbn = dev.flexy.dynamicisland.xposed.Refl.get(e, "mSbn");
+                if (sbn instanceof android.service.notification.StatusBarNotification) {
+                    active.add(((android.service.notification.StatusBarNotification) sbn).getKey());
+                }
+            }
+            kept.values().removeIf(it -> !active.contains(it.notificationKey));
+        }
+        if (!IslandSettings.notifIsland()) return;
+        out.addAll(kept.values());
+    }
+
+    private void forget(IslandItem item) {
+        if (item != null && item.notification && kept.remove(item.key) != null) requestRefresh();
+    }
+
+    /** The island is on screen and free: awake, unlocked, status bar showing, shade closed. */
+    private boolean canPresent() {
+        if (barState != 0 || dozing || statusBarWindowState != 0) return false;
+        if (view.shadePulled() || !view.canPresentNotification()) return false;
+        android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
+        return pm == null || pm.isInteractive();
+    }
+
+    private IslandItem replyItem;
+    private android.app.Notification.Action replyAction;
+
+    private void startReply(IslandItem item, android.app.Notification.Action action) {
+        if (window == null || view == null) return;
+        android.graphics.RectF card = new android.graphics.RectF();
+        if (!view.cardRect(item.key, card)) return;
+        replyItem = item;
+        replyAction = action;
+        view.holdPresented(true, 0);
+        CharSequence hint = null;
+        for (android.app.RemoteInput r : action.getRemoteInputs()) {
+            if (r.getAllowFreeFormInput()) {
+                hint = r.getLabel();
+                break;
+            }
+        }
+        window.showReply(card, hint != null ? hint : "Reply", new IslandWindow.ReplyListener() {
+            @Override
+            public void onSend(CharSequence text) {
+                sendReply(text);
+            }
+
+            @Override
+            public void onCancel() {
+                endReply();
+                if (view != null) view.holdPresented(false, NOTIF_AFTER_REPLY_MS);
+            }
+        });
+    }
+
+    private void sendReply(CharSequence text) {
+        android.app.Notification.Action a = replyAction;
+        forget(replyItem);
+        endReply();
+        if (a == null) return;
+        try {
+            android.app.RemoteInput[] inputs = a.getRemoteInputs();
+            Bundle results = new Bundle();
+            for (android.app.RemoteInput r : inputs) {
+                if (r.getAllowFreeFormInput()) results.putCharSequence(r.getResultKey(), text);
+            }
+            android.content.Intent fill = new android.content.Intent().addFlags(android.content.Intent.FLAG_RECEIVER_FOREGROUND);
+            android.app.RemoteInput.addResultsToIntent(inputs, fill, results);
+            android.app.RemoteInput.setResultsSource(fill, android.app.RemoteInput.SOURCE_FREE_FORM_INPUT);
+            a.actionIntent.send(ctx, 0, fill, null, null, null, balOptions().toBundle());
+            XLog.i("reply sent");
+        } catch (Throwable t) {
+            XLog.e("reply failed", t);
+        }
+        if (view != null) view.collapse();
+    }
+
+    /** Like tapping a heads-up: tells the system, which also auto-cancels the notification if the app asked for it. */
+    private void reportNotificationClick(String key) {
+        if (key == null) return;
+        try {
+            Object sbs = dev.flexy.dynamicisland.xposed.Refl.get(oa.notifCollection, "mStatusBarService");
+            Class<?> nvCls = Class.forName("com.android.internal.statusbar.NotificationVisibility");
+            Object nv = nvCls.getMethod("obtain", String.class, int.class, int.class, boolean.class).invoke(null, key, 0, 1, true);
+            if (sbs != null && nv != null) {
+                sbs.getClass().getMethod("onNotificationClick", String.class, nvCls).invoke(sbs, key, nv);
+            }
+        } catch (Throwable t) {
+            XLog.e("notification click report", t);
+        }
+    }
+
+    private void endReply() {
+        replyItem = null;
+        replyAction = null;
+        if (window != null) window.hideReply();
+    }
+
     @Override
     public void onExpandedChanged(boolean expanded) {
+        if (!expanded && window != null && window.isReplying()) endReply();
         if (window != null) window.setWatchOutsideTouch(expanded);
         pushExitTargets(false);
         if (!expanded) requestRefresh();
@@ -761,6 +942,11 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
 
     @Override
     public void onMinimize(IslandItem item) {
+        if (item != null && item.notification) {
+            // swiping a kept notification off the island removes it (it stays in the shade)
+            forget(item);
+            return;
+        }
         if (item == null || minimized.contains(item.key)) return;
         minimized.add(item.key);
         boost.remove(item.key);

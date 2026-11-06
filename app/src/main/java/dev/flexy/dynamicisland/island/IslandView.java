@@ -540,6 +540,12 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         primary = items.isEmpty() ? null : items.get(0);
         secondary = items.size() > 1 && bubbleFits(primary) ? items.get(1) : null;
 
+        // A notification card is out: keep it alone on screen; the new items show once it folds back.
+        if (presented != null && mode == Mode.EXPANDED) {
+            notifyHost();
+            return;
+        }
+
         if (primary == null) {
             if (mode == Mode.EXPANDED) collapseCards(false);
             goHidden(hint == HINT_MINIMIZE);
@@ -707,14 +713,6 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         return visibility.value() * suppress.value() * shadeAlpha();
     }
 
-    public boolean needsAudio() {
-        if (mode != Mode.COMPACT || mainIn == null || visibleAlpha() < 0.2f) return false;
-        IslandItem it = mainIn.content.item;
-        if (it.trailing == IslandItem.Trailing.WAVEFORM && it.playing) return true;
-        IslandItem b = detailedBubbleItem();
-        return b != null && b.trailing == IslandItem.Trailing.WAVEFORM && b.playing;
-    }
-
     public void getCoverageBounds(RectF out) {
         computeMain(out);
         if (split.value() > 0.2f) {
@@ -771,6 +769,11 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
 
     public void collapse() {
         if (mode != Mode.EXPANDED) return;
+        if (presented != null) {
+            presented = null;
+            presentedHold = false;
+            removeCallbacks(presentTimeout);
+        }
         removeCallbacks(fadePillBlob);
         pillBlob.animateTo(1f, 0.1f, 1f);
         scheduleFrame();
@@ -905,6 +908,78 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
 
     private float cardWidth() {
         return Math.min(screenW - cardMargin * 2f, cardMaxW);
+    }
+
+    // ---- notifications presented by the island instead of a heads-up ----
+
+    private IslandItem presented;
+    private boolean presentedHold;
+    private final Runnable presentTimeout = this::onPresentTimeout;
+    private static final long PRESENT_RETRY_MS = 1500;
+
+    /** The island can show a notification card now (it isn't open for something else). */
+    public boolean canPresentNotification() {
+        return mode != Mode.EXPANDED || presented != null;
+    }
+
+    public IslandItem presentedNotification() {
+        return presented;
+    }
+
+    /** Drops {@code item} out of the island as a card; folds back after {@code ms}. */
+    public void presentNotification(IslandItem item, long ms) {
+        presented = item;
+        presentedHold = false;
+        visibility.animateTo(1f, 0.22f, 1f);
+        expand(java.util.Collections.singletonList(item));
+        removeCallbacks(presentTimeout);
+        postDelayed(presentTimeout, ms);
+    }
+
+    /** Keeps the card out while the user is replying. */
+    public void holdPresented(boolean hold, long thenMs) {
+        presentedHold = hold;
+        removeCallbacks(presentTimeout);
+        if (!hold && presented != null) postDelayed(presentTimeout, thenMs);
+    }
+
+    public void endPresentation() {
+        if (presented == null) return;
+        collapse();
+    }
+
+    private void onPresentTimeout() {
+        if (presented == null) return;
+        if (presentedHold || fingerDown) {
+            postDelayed(presentTimeout, PRESENT_RETRY_MS);
+            return;
+        }
+        collapse();
+    }
+
+    private boolean fingerDown;
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) fingerDown = true;
+        else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) fingerDown = false;
+        return super.dispatchTouchEvent(e);
+    }
+
+    /** Current bounds of the card showing {@code key}, in window coordinates. */
+    public boolean cardRect(String key, RectF out) {
+        if (key == null || mode != Mode.EXPANDED) return false;
+        for (Card c : cards) {
+            if (c.leaving || !c.item.key.equals(key)) continue;
+            computeCard(c, out);
+            float left = centerFor(c.body.w) - c.body.w / 2f;
+            if (c.body.w < screenW) left = Math.max(Math.min(left, screenW - cardMargin - c.body.w), cardMargin);
+            out.left = left;
+            out.right = left + c.body.w;
+            return out.width() > 1f && out.height() > 1f;
+        }
+        return false;
     }
 
     private float stackTop() {
@@ -1211,20 +1286,20 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                 if (!c.leaving && !c.launched) continue;
                 computeCard(c, cardRect);
                 if (cardRect.width() < 1f || cardRect.height() < 1f) continue;
-                blur.place(c, cardRect, Math.min(cardRect.height() / 2f, cardRadius), vis, frostOn() ? FROST_BLUR : 0);
+                blur.place(c, cardRect, Math.min(cardRect.height() / 2f, cardRadius), vis, glassBlurRadius());
             }
             if (glassActive()) {
                 computeMain(blurRect);
                 float a = vis * pillBlob.value();
                 if (blurRect.width() > 2f && blurRect.height() > 2f) {
                     scaleAroundPill(blurRect, blurRect);
-                    blur.place(PILL_BLUR, blurRect, blurRect.height() / 2f, a, frostOn() ? FROST_BLUR : 0);
+                    blur.place(PILL_BLUR, blurRect, blurRect.height() / 2f, a, glassBlurRadius());
                 }
                 if (split.value() > 0.003f) {
                     computeMain(tmpBlur);
                     computeBubble(tmpBlur, blurRect);
                     scaleAroundPill(tmpBlur, blurRect);
-                    blur.place(BUBBLE_BLUR, blurRect, blurRect.height() / 2f, a, frostOn() ? FROST_BLUR : 0);
+                    blur.place(BUBBLE_BLUR, blurRect, blurRect.height() / 2f, a, glassBlurRadius());
                 }
             }
         }
@@ -1596,6 +1671,8 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         canvas.restoreToCount(save);
     }
 
+    private final Paint alignPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
     private void drawPillAndBubble(Canvas canvas, long t) {
         float r = mainRect.height() / 2f;
         float s = split.value();
@@ -1619,6 +1696,22 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
             hasNeck = spread > 0.01f && Metaball.neck(c1x, c1y, r1, bx, by, br, spread, neckPath);
         }
         boolean pillVisible = mainRect.width() > 0.5f && mainRect.height() > 0.5f;
+        if (IslandSettings.previewAlign()) {
+            // Alignment preview (vertical position slider): a plain white pill with a black outline,
+            // no content, so the black camera hole stands out against it.
+            if (!pillVisible) return;
+            float o = dp(2f);
+            alignPaint.setStyle(Paint.Style.FILL);
+            alignPaint.setColor(0xFFFFFFFF);
+            canvas.drawRoundRect(mainRect, r, r, alignPaint);
+            alignPaint.setStyle(Paint.Style.STROKE);
+            alignPaint.setStrokeWidth(o);
+            alignPaint.setColor(0xFF000000);
+            tmpRect.set(mainRect);
+            tmpRect.inset(o / 2f, o / 2f);
+            canvas.drawRoundRect(tmpRect, r - o / 2f, r - o / 2f, alignPaint);
+            return;
+        }
         boolean glass = glassActive();
         if (!glass && ((pillVisible && mode == Mode.COMPACT) || hasBubble)) {
             outlinePaint.setStyle(Paint.Style.FILL);
@@ -1642,7 +1735,9 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         }
         int mainColor = glass ? GLASS_COLOR : bodyColor(mainIn);
         boolean frost = glass && frostOn();
-        int glassSave = glass ? canvas.saveLayerAlpha(0, 0, screenW, getHeight(), Math.round(255 * (frost ? FROST_PILL : GLASS_ALPHA))) : -1;
+        boolean liquidPill = glass && liquidOn();
+        int glassSave = glass ? canvas.saveLayerAlpha(0, 0, screenW, getHeight(),
+                Math.round(255 * (liquidPill ? LIQUID_PILL : frost ? FROST_PILL : GLASS_ALPHA))) : -1;
         shapePaint.setColor(mainColor);
         shapePaint.setAlpha(Math.round(255 * pillBlob.value()));
         if (pillVisible) canvas.drawRoundRect(mainRect, r, r, shapePaint);
@@ -1663,13 +1758,16 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                 tmpBlur.set(bubbleRect);
                 drawFrost(canvas, tmpBlur, br, tmpBlur.height(), rimA);
             }
-            if (pillVisible && mode == Mode.COMPACT) {
+            if (liquidPill) {
+                if (pillVisible && mode == Mode.COMPACT) liquid.draw(canvas, mainRect, r, rimA);
+                if (hasBubble) liquid.draw(canvas, bubbleRect, br, rimA);
+            } else if (pillVisible && mode == Mode.COMPACT) {
                 cardStroke.setShader(rimShader(mainRect, rimA));
                 tmpRect.set(mainRect);
                 tmpRect.inset(outlineW / 2f, outlineW / 2f);
                 canvas.drawRoundRect(tmpRect, r, r, cardStroke);
             }
-            if (hasBubble) {
+            if (hasBubble && !liquidPill) {
                 tmpRect.set(bubbleRect);
                 cardStroke.setShader(rimShader(tmpRect, rimA));
                 tmpRect.inset(outlineW / 2f, outlineW / 2f);
@@ -1885,16 +1983,21 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
     private void drawCardInner(Canvas canvas, Card c, long t, float p) {
         float r = Math.min(cardRect.height() / 2f, cardRadius);
         boolean glass = blur != null && blur.available();
-        boolean frost = glass && IslandSettings.frostedCards();
+        boolean liquidCard = glass && liquidOn();
+        boolean frost = glass && !liquidCard && IslandSettings.frostedCards();
         float g = clamp01((p - 0.82f) / 0.18f);
-        float tint = lerp(1f, glass ? (frost ? FROST_TINT : 0.46f) : 0.9f, g);
+        float tint = lerp(1f, glass ? (liquidCard ? LIQUID_TINT : frost ? FROST_TINT : 0.46f) : 0.9f, g);
         cardPaint.setColor(Colors.withAlpha(glass ? 0xFF0E0E10 : 0xFF141416, tint));
         canvas.drawRoundRect(cardRect, r, r, cardPaint);
         if (frost && g > 0.003f) drawFrost(canvas, cardRect, r, c.body.h, g);
-        cardStroke.setShader(rimShader(cardRect, 0.4f + 0.6f * p));
-        tmpRect.set(cardRect);
-        tmpRect.inset(outlineW / 2f, outlineW / 2f);
-        canvas.drawRoundRect(tmpRect, r, r, cardStroke);
+        if (liquidCard) {
+            liquid.draw(canvas, cardRect, r, 0.4f + 0.6f * p);
+        } else {
+            cardStroke.setShader(rimShader(cardRect, 0.4f + 0.6f * p));
+            tmpRect.set(cardRect);
+            tmpRect.inset(outlineW / 2f, outlineW / 2f);
+            canvas.drawRoundRect(tmpRect, r, r, cardStroke);
+        }
 
         float contentAlpha = contentAlpha(c, t, p);
         if (contentAlpha <= 0.003f || c.body instanceof RemoteBody) return;
@@ -2543,6 +2646,7 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         if (it.claude) return new ClaudeBody(it, w);
         if (it.torch) return new TorchBody(it, w);
         if (it.alert) return new AlertBody(it, w);
+        if (it.notification) return new NotifBody(it, w);
         if (!shadeCard && it.remoteView != null && remoteLayer != null) {
             try {
                 return new RemoteBody(it, w);
@@ -2731,11 +2835,36 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
     private static final float FROST_GLOW = 0.2f;
 
     private boolean frostOn() {
-        return blur != null && blur.available() && IslandSettings.frostedCards();
+        return blur != null && blur.available() && IslandSettings.frostedCards() && !liquidOn();
     }
 
+    /** Liquid glass: clear backdrop blur with a refractive glass surface on top (see {@link LiquidGlass}). */
+    private boolean liquidOn() {
+        return blur != null && blur.available() && IslandSettings.liquidGlass() && liquidGlass() != null && liquid.usable();
+    }
+
+    private LiquidGlass liquid;
+    private boolean liquidTried;
+
+    private LiquidGlass liquidGlass() {
+        if (!liquidTried) {
+            liquidTried = true;
+            liquid = LiquidGlass.create(dp(1));
+        }
+        return liquid;
+    }
+
+    /** Backdrop blur radius for the current glass style; 0 means BlurLayer's default. */
+    private int glassBlurRadius() {
+        if (liquidOn()) return IslandSettings.liquidBlur();
+        return frostOn() ? FROST_BLUR : 0;
+    }
+
+    private static final float LIQUID_TINT = 0.22f;
+    private static final float LIQUID_PILL = 0.30f;
+
     private int frostBg(Btn b) {
-        return b.bg == 0xFF3A3A3C && frostOn() ? FROST_BUTTON : b.bg;
+        return b.bg == 0xFF3A3A3C && (frostOn() || liquidOn()) ? FROST_BUTTON : b.bg;
     }
 
     private abstract class CardBody {
@@ -2884,11 +3013,77 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                 Btn b = new Btn();
                 b.r.set(pad + i * (bw + gap), top, pad + i * (bw + gap) + bw, top + bh);
                 b.label = a.title == null ? null : a.title.toString();
-                b.bg = a.destructive ? BUTTON_RED : 0x2EFFFFFF;
+                b.bg = a.destructive ? BUTTON_RED : a.emphasized ? emphasisColor(item.accent) : 0x2EFFFFFF;
                 b.action = a;
                 buttons.add(b);
             }
             return bh;
+        }
+    }
+
+    /** Accent for a card's main button; white/greyish accents fall back to system blue so the label stays readable. */
+    private static int emphasisColor(int accent) {
+        float[] hsv = new float[3];
+        android.graphics.Color.colorToHSV(accent, hsv);
+        if (hsv[1] < 0.25f) return 0xFF0A84FF;
+        return Colors.blend(accent, 0xFF000000, 0.25f);
+    }
+
+    /** A notification card: avatar, app, sender/title, message and the app's buttons (Reply first-class). */
+    private final class NotifBody extends CardBody {
+        final float pad = dp(16);
+        final float avatar = dp(42);
+        final StaticLayout app;
+        final StaticLayout title;
+        final StaticLayout text;
+        float actionsTop = -1;
+
+        NotifBody(IslandItem item, float w) {
+            super(item, w);
+            int textW = Math.max(1, Math.round(w - pad * 2 - avatar - dp(12)));
+            app = item.appName == null ? null : layout(item.appName, smallPaint, textW, 1);
+            title = item.title == null ? null : layout(item.title, titlePaint, textW, 2);
+            text = item.subtitle == null ? null : layout(item.subtitle, bodyPaint, textW, 4);
+            float y = pad;
+            if (app != null) y += app.getHeight() + dp(2);
+            if (title != null) y += title.getHeight();
+            if (text != null) y += dp(2) + text.getHeight();
+            y = Math.max(y, pad + avatar);
+            if (!item.actions.isEmpty()) {
+                actionsTop = y + dp(14);
+                y = actionsTop + layoutTextButtons(actionsTop, pad);
+            }
+            h = y + pad;
+        }
+
+        @Override
+        void draw(Canvas c, float x, float y, float alpha, long el) {
+            float a0 = alpha * rowAlpha(el, 0);
+            float top = y + pad + (1f - rowAlpha(el, 0)) * dp(8);
+            if (item.cardImage != null) {
+                drawDrawable(c, item.cardImage, true, 0, x + pad, top, avatar, a0,
+                        item.cardImageRound ? avatar / 2f : avatar * 0.26f);
+            }
+            float tx = x + pad + avatar + dp(12);
+            float ty = top;
+            if (app != null) {
+                smallPaint.setColor(Colors.withAlpha(0x99FFFFFF, a0));
+                drawLayout(c, app, tx, ty);
+                ty += app.getHeight() + dp(2);
+            }
+            if (title != null) {
+                titlePaint.setColor(Colors.withAlpha(0xFFFFFFFF, a0));
+                drawLayout(c, title, tx, ty);
+                ty += title.getHeight() + dp(2);
+            }
+            if (text != null) {
+                bodyPaint.setColor(Colors.withAlpha(0xD9FFFFFF, a0));
+                drawLayout(c, text, tx, ty);
+            }
+            if (actionsTop >= 0) {
+                float ra = rowAlpha(el, 1);
+                drawButtons(c, x, y + (1f - ra) * dp(8), alpha * ra);
+            }
         }
     }
 
@@ -5071,6 +5266,7 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
     }
 
     public void onSettingsChanged() {
+        invalidate(); // e.g. the white alignment preview switching on/off
         if (mainIn != null && mainIn.content instanceof CompactContent) {
             CompactContent cc = (CompactContent) mainIn.content;
             if (cc.remeasure() && mode == Mode.COMPACT) {

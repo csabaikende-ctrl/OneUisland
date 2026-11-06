@@ -36,12 +36,29 @@ final class AudioLevels {
         bg = new Handler(t.getLooper());
     }
 
+    /**
+     * Attaching or detaching the visualizer re-runs the effect-chain configuration of the music
+     * output (audible as a short dropout, very noticeable on Exynos devices and with effects such
+     * as Dolby / ViPER4Android in the chain). Callers must therefore only toggle this with
+     * playback, not with island visuals, and the release is delayed so track changes and short
+     * pause/play flickers don't cause a detach + re-attach.
+     */
+    private static final long RELEASE_DELAY_MS = 5_000;
+    private final Runnable releaseRunnable = () -> {
+        if (viz != null) stop();
+    };
+
     void setActive(boolean active) {
         if (active == wanted) return;
         wanted = active;
         bg.post(() -> {
-            if (active && viz == null) start();
-            else if (!active && viz != null) stop();
+            if (active) {
+                bg.removeCallbacks(releaseRunnable);
+                if (viz == null) start();
+            } else if (viz != null) {
+                bg.removeCallbacks(releaseRunnable);
+                bg.postDelayed(releaseRunnable, RELEASE_DELAY_MS);
+            }
         });
     }
 

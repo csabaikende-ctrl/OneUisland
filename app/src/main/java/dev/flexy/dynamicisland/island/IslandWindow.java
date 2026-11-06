@@ -150,6 +150,9 @@ final class IslandWindow {
 
     void invalidateTouchRegion() {
         view.getTouchRegion(scratchRegion);
+        if (replyBar != null && replyBar.getVisibility() == View.VISIBLE && replyBar.getWidth() > 0) {
+            scratchRegion.op(replyBar.getLeft(), replyBar.getTop(), replyBar.getRight(), replyBar.getBottom(), Region.Op.UNION);
+        }
         if (scratchRegion.equals(touchRegion)) return;
         touchRegion.set(scratchRegion);
         root.invalidate();
@@ -260,6 +263,152 @@ final class IslandWindow {
         } catch (Throwable t) {
             XLog.e("touchable region unavailable", t);
         }
+    }
+
+    // ---- inline reply field (shown under a notification card) ----
+
+    interface ReplyListener {
+        void onSend(CharSequence text);
+
+        void onCancel();
+    }
+
+    private android.widget.LinearLayout replyBar;
+    private android.widget.EditText replyEdit;
+    private ReplyListener replyListener;
+
+    boolean isReplying() {
+        return replyBar != null && replyBar.getVisibility() == View.VISIBLE;
+    }
+
+    void showReply(android.graphics.RectF card, CharSequence hint, ReplyListener listener) {
+        float dp = context.getResources().getDisplayMetrics().density;
+        if (replyBar == null) buildReplyBar(dp);
+        replyListener = listener;
+        replyEdit.setText("");
+        replyEdit.setHint(hint);
+        FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(Math.round(card.width()), ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.leftMargin = Math.round(card.left);
+        p.topMargin = Math.round(card.bottom + 8 * dp);
+        replyBar.setLayoutParams(p);
+        replyBar.setVisibility(View.VISIBLE);
+        setFocusable(true);
+        replyEdit.requestFocus();
+        showIme(0);
+        root.post(this::invalidateTouchRegion);
+    }
+
+    void hideReply() {
+        if (replyBar == null || replyBar.getVisibility() != View.VISIBLE) return;
+        android.view.inputmethod.InputMethodManager imm =
+                context.getSystemService(android.view.inputmethod.InputMethodManager.class);
+        if (imm != null) imm.hideSoftInputFromWindow(replyEdit.getWindowToken(), 0);
+        replyEdit.clearFocus();
+        replyBar.setVisibility(View.GONE);
+        replyListener = null;
+        setFocusable(false);
+        invalidateTouchRegion();
+    }
+
+    private void setFocusable(boolean focusable) {
+        boolean now = (lp.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) == 0;
+        if (now == focusable) return;
+        if (focusable) {
+            lp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                    | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE;
+        } else {
+            lp.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED;
+        }
+        if (added) updateLayout();
+    }
+
+    /** The window only gets input focus after relayout, so retry briefly until the keyboard is up. */
+    private void showIme(int attempt) {
+        if (replyEdit == null || !isReplying()) return;
+        if (replyEdit.hasWindowFocus()) {
+            android.view.inputmethod.InputMethodManager imm =
+                    context.getSystemService(android.view.inputmethod.InputMethodManager.class);
+            if (imm != null) imm.showSoftInput(replyEdit, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+            android.view.WindowInsetsController c = replyEdit.getWindowInsetsController();
+            if (c != null) c.show(WindowInsets.Type.ime());
+            return;
+        }
+        if (attempt < 20) root.postDelayed(() -> showIme(attempt + 1), 50);
+    }
+
+    private void buildReplyBar(float dp) {
+        replyBar = new android.widget.LinearLayout(context);
+        replyBar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        replyBar.setGravity(Gravity.CENTER_VERTICAL);
+        int pad = Math.round(6 * dp);
+        replyBar.setPadding(Math.round(16 * dp), pad, pad, pad);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setColor(0xF21C1C1E);
+        bg.setCornerRadius(24 * dp);
+        bg.setStroke(Math.max(1, Math.round(dp)), 0x33FFFFFF);
+        replyBar.setBackground(bg);
+
+        replyEdit = new android.widget.EditText(context);
+        replyEdit.setBackground(null);
+        replyEdit.setTextColor(0xFFFFFFFF);
+        replyEdit.setHintTextColor(0x80FFFFFF);
+        replyEdit.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16);
+        replyEdit.setPadding(0, Math.round(8 * dp), 0, Math.round(8 * dp));
+        replyEdit.setMaxLines(4);
+        replyEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                | android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+                | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        replyEdit.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        replyEdit.setHorizontallyScrolling(false);
+        replyEdit.setOnEditorActionListener((v, id, ev) -> {
+            if (id == android.view.inputmethod.EditorInfo.IME_ACTION_SEND) {
+                send();
+                return true;
+            }
+            return false;
+        });
+        replyEdit.setOnKeyListener((v, code, ev) -> {
+            if (code == android.view.KeyEvent.KEYCODE_BACK && ev.getAction() == android.view.KeyEvent.ACTION_UP) {
+                ReplyListener l = replyListener;
+                if (l != null) l.onCancel();
+                return true;
+            }
+            return false;
+        });
+        replyBar.addView(replyEdit, new android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        android.widget.TextView sendButton = new android.widget.TextView(context);
+        sendButton.setText("\u2191");
+        sendButton.setTextColor(0xFFFFFFFF);
+        sendButton.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 20);
+        sendButton.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        sendButton.setGravity(Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable sbg = new android.graphics.drawable.GradientDrawable();
+        sbg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        sbg.setColor(0xFF0A84FF);
+        sendButton.setBackground(sbg);
+        sendButton.setContentDescription("Send");
+        sendButton.setOnClickListener(v -> send());
+        int size = Math.round(38 * dp);
+        android.widget.LinearLayout.LayoutParams slp = new android.widget.LinearLayout.LayoutParams(size, size);
+        slp.leftMargin = Math.round(8 * dp);
+        replyBar.addView(sendButton, slp);
+
+        replyBar.setVisibility(View.GONE);
+        replyBar.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> invalidateTouchRegion());
+        root.addView(replyBar);
+    }
+
+    private void send() {
+        CharSequence text = replyEdit.getText();
+        if (text == null || text.toString().trim().isEmpty()) return;
+        ReplyListener l = replyListener;
+        CharSequence copy = text.toString();
+        if (l != null) l.onSend(copy);
     }
 
     private static final class Root extends FrameLayout {

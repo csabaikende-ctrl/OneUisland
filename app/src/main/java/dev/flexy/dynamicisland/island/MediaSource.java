@@ -92,6 +92,22 @@ final class MediaSource {
         out.add(item);
     }
 
+    /**
+     * True while any tracked media session (other than Voice Recorder) is playing, whether or not
+     * its item is currently shown. The audio visualizer is kept attached for as long as this is
+     * true: attaching or detaching it reconfigures the output's effect chain, which makes the music
+     * glitch, so that must only happen when playback starts or stops, never on an island
+     * transition (opening the card, screen off, alerts, the player app coming to the foreground).
+     */
+    boolean anyPlaying() {
+        for (Tracked t : tracked.values()) {
+            if (t.isPlaying() && t.hasContent() && !VoiceLevels.PACKAGE.equals(t.controller.getPackageName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     IslandItem itemForSession(MediaSession.Token token) {
         Tracked t = tracked.get(token);
         if (t != null && VoiceLevels.PACKAGE.equals(t.controller.getPackageName())) return null;
