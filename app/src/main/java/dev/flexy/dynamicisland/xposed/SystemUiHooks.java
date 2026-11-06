@@ -213,10 +213,10 @@ final class SystemUiHooks {
     private static final int TAG_CHIP_HIDER = 0x7e0c4155;
 
     /**
-     * Android 16 Compose status bar: the chips (call, screen recording, casting, promoted
-     * notifications) are drawn only when ChipsVisibilityModel allows them. The island shows all
-     * of these, so they're disallowed, except while every active chip is a countdown (screen
-     * recording's 3-2-1), which the island doesn't show.
+     * Android 16 Compose status bar: the chips (call, screen recording and its 3-2-1 countdown,
+     * casting, promoted notifications) are drawn only when ChipsVisibilityModel allows them. The
+     * island shows all of these, so they're always disallowed; a countdown chip is forwarded to
+     * the island.
      */
     private static void hookComposeChips(ClassLoader cl) {
         // The model's constructor and the lambda's invokeSuspend are tiny and get inlined into
@@ -245,19 +245,21 @@ final class SystemUiHooks {
 
     private static void disallowChips(Object model) throws Throwable {
         if (model == null || !model.getClass().getName().endsWith(".ChipsVisibilityModel")) return;
-        if (c() == null || !Refl.getBool(model, "areChipsAllowed", false)) return;
+        IslandController c = c();
+        if (c == null) return;
+        long countdown = -1;
         Object active = Refl.get(Refl.get(model, "chips"), "active");
-        boolean onlyCountdown = active instanceof java.util.List && !((java.util.List<?>) active).isEmpty();
-        if (onlyCountdown) {
+        if (active instanceof java.util.List) {
             for (Object chip : (java.util.List<?>) active) {
                 Object content = Refl.get(chip, "content");
-                if (content == null || !content.getClass().getName().endsWith("$Countdown")) {
-                    onlyCountdown = false;
-                    break;
+                if (content != null && content.getClass().getName().endsWith("$Countdown")) {
+                    Object s = Refl.get(content, "secondsUntilStarted");
+                    if (s instanceof Long) countdown = (Long) s;
                 }
             }
         }
-        if (onlyCountdown) return;
+        c.setRecordingCountdown(countdown);
+        if (!Refl.getBool(model, "areChipsAllowed", false)) return;
         java.lang.reflect.Field f = Refl.field(model.getClass(), "areChipsAllowed");
         if (f != null) f.setBoolean(model, false);
     }

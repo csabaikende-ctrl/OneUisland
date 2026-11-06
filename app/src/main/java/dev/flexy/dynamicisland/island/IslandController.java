@@ -384,6 +384,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
             torch.collect(items, view.isExpanded());
             addSavedRecording(items);
             addKeptNotifications(items);
+            addRecordingCountdown(items);
         } catch (Throwable t) {
             XLog.e("collect failed", t);
         }
@@ -792,6 +793,40 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
 
     private void forget(IslandItem item) {
         if (item != null && item.notification && kept.remove(item.key) != null) requestRefresh();
+    }
+
+    // ---- screen recording 3-2-1 (AOSP status bar chip, shown by the island like on iOS) ----
+
+    private volatile long recordingCountdown = -1;
+
+    /** Seconds until a screen recording starts, or -1. Called from the status bar's chip flow (any thread). */
+    public void setRecordingCountdown(long seconds) {
+        if (seconds == recordingCountdown) return;
+        recordingCountdown = seconds;
+        requestRefresh();
+    }
+
+    /**
+     * Same key as the recording item, so when recording starts the countdown turns into the red
+     * dot and timer in place instead of being replaced.
+     */
+    private void addRecordingCountdown(List<IslandItem> out) {
+        long s = recordingCountdown;
+        if (s < 0) return;
+        for (IslandItem it : out) if ("cast:record".equals(it.key)) return;
+        boolean ru = "ru".equals(java.util.Locale.getDefault().getLanguage());
+        IslandItem it = new IslandItem("cast:record");
+        it.kind = IslandItem.Kind.RECORDING;
+        it.accent = CastSource.RED;
+        it.pulsingDot = true;
+        it.title = ru ? "Запись экрана" : "Screen recording";
+        it.appName = it.title;
+        it.packageName = "com.android.systemui";
+        it.trailing = IslandItem.Trailing.TEXT;
+        it.trailingText = String.valueOf(Math.max(1, s));
+        it.noExpand = true;
+        it.postTime = Long.MAX_VALUE - 1;
+        out.add(it);
     }
 
     /** The island is on screen and free: awake, unlocked, status bar showing, shade closed. */
