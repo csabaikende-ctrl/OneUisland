@@ -149,6 +149,10 @@ public final class IslandItem {
     public boolean iconColor;
     public int iconTint;
     public int trailingColor;
+    /** uptimeMillis until which the item's icon animates (the island keeps drawing frames). */
+    public long animatedUntil;
+    /** The compact icon is wider than tall (the battery): it gets a wider slot and isn't clipped. */
+    public boolean wideIcon;
     public CharSequence overline;
     public int overlineColor;
     public Runnable iconTap;

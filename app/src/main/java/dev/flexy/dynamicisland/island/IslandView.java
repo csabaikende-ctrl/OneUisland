@@ -1336,6 +1336,10 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         IslandItem detailed = detailedBubbleItem();
         if (waveItem == null && detailed != null && detailed.trailing == IslandItem.Trailing.WAVEFORM) waveItem = detailed;
         if (mainIn != null) need |= runningStopwatch(mainIn.content.item);
+        long upNow = SystemClock.uptimeMillis();
+        if (mainIn != null) need |= upNow < mainIn.content.item.animatedUntil;
+        if (bubbleIn != null) need |= upNow < bubbleIn.content.item.animatedUntil;
+        for (Card c : cards) need |= upNow < c.item.animatedUntil;
         need |= claudeAnimating();
         need |= now() < rollUntil;
         need |= toggleAnimating();
@@ -2321,6 +2325,8 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         abstract void draw(Canvas c, RectF shape, float alpha, long elapsedIn);
     }
 
+    private static final float WIDE_ICON = 1.55f;
+
     private final class CompactContent extends Content {
         String trailText;
         float trailW;
@@ -2388,6 +2394,7 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
         }
 
         private float leadWidth() {
+            if (item.wideIcon) return leadSize * WIDE_ICON;
             return item.recorder ? recWaveWidth() : leadSize;
         }
 
@@ -2430,7 +2437,16 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                 }
                 return;
             }
-            drawLeadingMono(c, item, s.left + padding, midY, lead, alpha);
+            if (item.wideIcon && item.icon != null) {
+                // e.g. the battery: wider than tall, drawn unclipped in a wider slot
+                int l = Math.round(s.left + padding);
+                int t = Math.round(midY - lead / 2f);
+                item.icon.setBounds(l, t, Math.round(l + lead * WIDE_ICON), Math.round(t + lead));
+                item.icon.setAlpha(Math.round(255 * alpha));
+                item.icon.draw(c);
+            } else {
+                drawLeadingMono(c, item, s.left + padding, midY, lead, alpha);
+            }
             if (trailW > 0) drawTrailing(c, item, trailText, s.right - padding, midY, trailW, alpha);
         }
 

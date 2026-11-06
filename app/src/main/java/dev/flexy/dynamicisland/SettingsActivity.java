@@ -122,6 +122,7 @@ public final class SettingsActivity extends Activity {
         toggle(alerts, "Do Not Disturb", Settings.ALERT_DND, Settings.DEF_ALERT_DND);
         toggle(alerts, "Sound / Vibrate / Mute", Settings.ALERT_RINGER, Settings.DEF_ALERT_RINGER);
         toggle(alerts, "Low battery (20% and 10%)", Settings.ALERT_BATTERY, Settings.DEF_ALERT_BATTERY);
+        toggle(alerts, "Charging started", Settings.ALERT_CHARGING, Settings.DEF_ALERT_CHARGING);
 
         Button reset = new Button(this);
         reset.setText("Reset to defaults");

@@ -155,9 +155,12 @@ final class AlertSource {
                 public void onReceive(Context c, Intent i) {
                     int level = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
                     int scale = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
-                    boolean plugged = i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0;
+                    int pluggedType = i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
+                    boolean plugged = pluggedType != 0;
                     if (level < 0 || scale <= 0) return;
-                    onBatteryLevel(Math.round(level * 100f / scale), plugged);
+                    int pct = Math.round(level * 100f / scale);
+                    onPlugged(plugged, pluggedType, pct, chargeWatts(i));
+                    onBatteryLevel(pct, plugged);
                 }
             }, new IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_EXPORTED);
         } catch (Throwable t) {
@@ -192,6 +195,60 @@ final class AlertSource {
                 return;
             }
         }
+    }
+
+    // ---- charging started ----
+
+    private static final long CHARGING_SHOW_MS = 3200;
+    private static final int CHARGE_GREEN = 0xFF34C759;
+    private static final float FAST_WATTS = 18f;
+    private Boolean wasPlugged;
+
+    /** Shows the charging animation when power is connected (not for the state at registration). */
+    private void onPlugged(boolean plugged, int type, int level, float watts) {
+        Boolean before = wasPlugged;
+        wasPlugged = plugged;
+        if (before == null || before || !plugged || !IslandSettings.alertCharging()) return;
+        show(chargingItem(level, type, watts), CHARGING_SHOW_MS);
+    }
+
+    /** Charger power from the battery broadcast extras (µA × µV), 0 if unknown. */
+    private static float chargeWatts(Intent i) {
+        int current = i.getIntExtra("max_charging_current", 0);
+        int voltage = i.getIntExtra("max_charging_voltage", 0);
+        if (current <= 0) return 0f;
+        if (voltage <= 0) voltage = 5_000_000;
+        return current / 1_000_000f * (voltage / 1_000_000f);
+    }
+
+    IslandItem chargingItem(int level, int type, float watts) {
+        boolean ru = "ru".equals(java.util.Locale.getDefault().getLanguage());
+        long start = SystemClock.uptimeMillis();
+        IslandItem it = new IslandItem("alert:charging");
+        it.alert = true;
+        it.kind = IslandItem.Kind.CHARGING;
+        it.packageName = ctx.getPackageName();
+        it.icon = new BatteryIcon(level, CHARGE_GREEN, true, true, start);
+        it.wideIcon = true;
+        it.cardImage = new BatteryIcon(level, CHARGE_GREEN, true, true, start);
+        it.iconIsImage = true;
+        it.cardImageIsImage = true;
+        it.iconColor = true;
+        it.iconRight = true;
+        it.accent = CHARGE_GREEN;
+        it.trailing = IslandItem.Trailing.TEXT;
+        it.trailingText = level + "%";
+        it.trailingColor = CHARGE_GREEN;
+        it.animatedUntil = start + BatteryIcon.ANIM_MS;
+        if (type == android.os.BatteryManager.BATTERY_PLUGGED_WIRELESS) {
+            it.title = ru ? "Беспроводная зарядка" : "Wireless charging";
+        } else if (watts >= FAST_WATTS) {
+            it.title = ru ? "Быстрая зарядка" : "Fast charging";
+        } else {
+            it.title = ru ? "Зарядка" : "Charging";
+        }
+        it.postTime = Long.MAX_VALUE;
+        return it;
     }
 
     private boolean powerSaving() {
@@ -243,6 +300,13 @@ final class AlertSource {
             it.icon = new Fit(d, 1f);
             Drawable big = statusBarBattery(level, batteryColor);
             it.cardImage = big == null ? null : new Fit(big, 0.72f);
+            it.iconIsImage = true;
+            it.cardImageIsImage = true;
+        } else {
+            // AOSP: no One UI battery drawable
+            it.icon = new BatteryIcon(level, batteryColor, false, false, 0);
+            it.wideIcon = true;
+            it.cardImage = new BatteryIcon(level, batteryColor, false, false, 0);
             it.iconIsImage = true;
             it.cardImageIsImage = true;
         }

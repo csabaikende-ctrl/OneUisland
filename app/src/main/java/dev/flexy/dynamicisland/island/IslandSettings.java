@@ -29,6 +29,10 @@ final class IslandSettings {
         return values.getBoolean(Settings.PREVIEW_ALIGN, false);
     }
 
+    static boolean alertCharging() {
+        return values.getBoolean(Settings.ALERT_CHARGING, Settings.DEF_ALERT_CHARGING);
+    }
+
     static boolean alertBattery() {
         return values.getBoolean(Settings.ALERT_BATTERY, Settings.DEF_ALERT_BATTERY);
     }
