@@ -46,6 +46,7 @@ final class SystemUiHooks {
         if (Build.VERSION.SDK_INT == 36) hookAndroid16Chips(cl);
         hookAospNotifications(cl);
         hookHeadsUpDecision(cl);
+        hookComposeChips(cl);
         ShadePerf.install(cl);
         ShadeLayoutCallbacks.install();
         ShadeLiveCards.install(cl);
@@ -210,6 +211,56 @@ final class SystemUiHooks {
     }
 
     private static final int TAG_CHIP_HIDER = 0x7e0c4155;
+
+    /**
+     * Android 16 Compose status bar: the chips (call, screen recording, casting, promoted
+     * notifications) are drawn only when ChipsVisibilityModel allows them. The island shows all
+     * of these, so they're disallowed, except while every active chip is a countdown (screen
+     * recording's 3-2-1), which the island doesn't show.
+     */
+    private static void hookComposeChips(ClassLoader cl) {
+        // The model's constructor and the lambda's invokeSuspend are tiny and get inlined into
+        // compiled callers, where hooks don't fire. The lambda's invoke() is reached through the
+        // Function3 interface from the shared combine() code, so it isn't; hook both and ask the
+        // framework to deoptimize invoke() so the inner hook runs too.
+        String lambda = "com.android.systemui.statusbar.pipeline.shared.ui.viewmodel.HomeStatusBarViewModelImpl$chipsVisibilityModel$1";
+        SafeHook adjust = SafeHook.after("chips visibility", p -> disallowChips(p.getResult()));
+        Refl.hookAll(cl, lambda, "invoke", adjust);
+        Refl.hookAll(cl, lambda, "invokeSuspend", adjust);
+        Class<?> cls = Refl.findClass(lambda, cl);
+        if (cls != null) {
+            for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+                if ("invoke".equals(m.getName())) deoptimize(m);
+            }
+        }
+    }
+
+    /** LSPosed-family XposedBridge.deoptimizeMethod, when the framework has it. */
+    private static void deoptimize(java.lang.reflect.Member m) {
+        try {
+            XposedBridge.class.getMethod("deoptimizeMethod", java.lang.reflect.Member.class).invoke(null, m);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void disallowChips(Object model) throws Throwable {
+        if (model == null || !model.getClass().getName().endsWith(".ChipsVisibilityModel")) return;
+        if (c() == null || !Refl.getBool(model, "areChipsAllowed", false)) return;
+        Object active = Refl.get(Refl.get(model, "chips"), "active");
+        boolean onlyCountdown = active instanceof java.util.List && !((java.util.List<?>) active).isEmpty();
+        if (onlyCountdown) {
+            for (Object chip : (java.util.List<?>) active) {
+                Object content = Refl.get(chip, "content");
+                if (content == null || !content.getClass().getName().endsWith("$Countdown")) {
+                    onlyCountdown = false;
+                    break;
+                }
+            }
+        }
+        if (onlyCountdown) return;
+        java.lang.reflect.Field f = Refl.field(model.getClass(), "areChipsAllowed");
+        if (f != null) f.setBoolean(model, false);
+    }
 
     private static final String VIDP = "com.android.systemui.statusbar.notification.interruption.VisualInterruptionDecisionProviderImpl";
 

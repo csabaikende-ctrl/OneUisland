@@ -124,6 +124,10 @@ final class OaSource {
                     int imp = ((android.service.notification.NotificationListenerService.Ranking) ranking).getImportance();
                     if (imp >= 0 && imp <= android.app.NotificationManager.IMPORTANCE_MIN) continue;
                 }
+                if (isAospScreenRecord(pkg, n)) {
+                    out.add(screenRecordItem(n));
+                    continue;
+                }
                 boolean call = isCallStyle(n);
                 if (!call && !isAospLive(entry, pkg, n)) continue;
                 String target = targetPackage(n.contentIntent);
@@ -189,6 +193,44 @@ final class OaSource {
         if (Notification.CATEGORY_NAVIGATION.equals(n.category) || Notification.CATEGORY_STOPWATCH.equals(n.category)) return true;
         if (x.getCharSequence("android.shortCriticalText") != null) return true;
         return x.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0 && !x.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false);
+    }
+
+    /** SystemUI's own screen recording notification (AOSP RecordingService). */
+    private static boolean isAospScreenRecord(String pkg, Notification n) {
+        return "com.android.systemui".equals(pkg) && "screen_record".equals(n.getChannelId())
+                && (n.flags & Notification.FLAG_ONGOING_EVENT) != 0;
+    }
+
+    /**
+     * Screen recording looks the same as on One UI ({@link CastSource}): red, pulsing dot,
+     * "Screen recording", elapsed time and a Stop button.
+     */
+    private IslandItem screenRecordItem(Notification n) {
+        boolean ru = "ru".equals(java.util.Locale.getDefault().getLanguage());
+        IslandItem it = new IslandItem("cast:record");
+        it.kind = IslandItem.Kind.RECORDING;
+        it.accent = CastSource.RED;
+        it.pulsingDot = true;
+        it.title = ru ? "Запись экрана" : "Screen recording";
+        it.appName = it.title;
+        it.packageName = "com.android.systemui";
+        it.contentIntent = n.contentIntent;
+        if (n.when > 0 && n.extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)) {
+            it.trailing = IslandItem.Trailing.CHRONOMETER;
+            it.chronoBase = n.when;
+            it.chronoCountDown = false;
+        }
+        if (n.actions != null) {
+            for (Notification.Action a : n.actions) {
+                if (a == null || a.actionIntent == null || a.title == null) continue;
+                IslandItem.Action stop = new IslandItem.Action(ru ? "Остановить" : a.title, null, a.actionIntent, null, true);
+                stop.glyph = Glyphs.STOP; // round red button with a square, like the camera's stop
+                it.actions.add(stop);
+                break;
+            }
+        }
+        it.postTime = Long.MAX_VALUE - 1;
+        return it;
     }
 
     private static final int CALL_TYPE_INCOMING = 1; // Notification.CallStyle.CALL_TYPE_INCOMING

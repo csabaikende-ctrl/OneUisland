@@ -12,7 +12,7 @@ import java.util.Locale;
 import dev.flexy.dynamicisland.xposed.Refl;
 
 final class CastSource {
-    private static final int RED = 0xFFFF3B30;
+    static final int RED = 0xFFFF3B30;
     private static final int BLUE = 0xFF0A84FF;
 
     private final Context ctx;
