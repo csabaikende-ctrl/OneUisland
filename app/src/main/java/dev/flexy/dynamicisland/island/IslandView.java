@@ -5144,6 +5144,7 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                     return true;
                 }
                 if (dragging && mode == Mode.COMPACT && (downOnMain || downOnBubble)
+                        && compactTouchedNotification() == null
                         && dy > touchSlop && Math.abs(dy) > Math.abs(dx)) {
                     forwardingShade = true;
                     press.animateTo(1f, 0.35f, 0.6f);
@@ -5194,6 +5195,21 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
                     return true;
                 }
                 if (dragging) {
+                    // A swipe in any direction takes a notification off the island, both the
+                    // pill and the card shown when it arrives (it stays in the shade).
+                    boolean swiped = Math.hypot(dx, dy) > dp(26);
+                    IslandItem notif = mode == Mode.COMPACT ? compactTouchedNotification()
+                            : mode == Mode.EXPANDED && downCard != null && downCard.item != null
+                                    && downCard.item.notification ? downCard.item : null;
+                    if (swiped && notif != null) {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
+                        if (mode == Mode.EXPANDED) {
+                            releaseStack();
+                            collapse();
+                        }
+                        host.onMinimize(notif);
+                        return true;
+                    }
                     if (mode == Mode.COMPACT && horizontal) {
                         performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
                         if (dx < 0) {
@@ -5232,6 +5248,13 @@ public final class IslandView extends View implements Choreographer.FrameCallbac
             default:
                 return true;
         }
+    }
+
+    /** The notification under the finger on the compact island, if it shows one. */
+    private IslandItem compactTouchedNotification() {
+        if (!downOnMain && !downOnBubble) return null;
+        IslandItem t = downOnBubble && secondary != null ? secondary : primary;
+        return t != null && t.notification ? t : null;
     }
 
     private void onTap(float x, float y) {
