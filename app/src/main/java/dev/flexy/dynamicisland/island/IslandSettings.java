@@ -125,6 +125,24 @@ final class IslandSettings {
                 }
             });
             bg.post(fetch);
+            // The settings live in the app's credential-encrypted storage, so the provider
+            // cannot run before the first unlock after a reboot. SystemUI starts before that,
+            // and the first fetch fails (the island would keep the defaults, e.g. offset 0,
+            // until a setting changed). Fetch again once the user is unlocked.
+            android.os.UserManager um = ctx.getSystemService(android.os.UserManager.class);
+            if (um == null || !um.isUserUnlocked()) {
+                ctx.registerReceiver(new android.content.BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context c, android.content.Intent i) {
+                        try {
+                            ctx.unregisterReceiver(this);
+                        } catch (Throwable ignored) {
+                        }
+                        bg.post(fetch);
+                    }
+                }, new android.content.IntentFilter(android.content.Intent.ACTION_USER_UNLOCKED),
+                        null, bg, Context.RECEIVER_NOT_EXPORTED);
+            }
         } catch (Throwable t) {
             XLog.e("island settings watch", t);
         }
