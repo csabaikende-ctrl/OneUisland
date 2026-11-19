@@ -26,6 +26,8 @@ final class AudioLevels {
     private long lastFft;
     private final Handler bg;
     private Visualizer viz;
+    /** Handle from {@link SharedAudioTap#source} when the host provides the tap. */
+    private Object sharedTap;
     private volatile long lastData;
     private long failedAt;
     private boolean wanted;
@@ -45,8 +47,12 @@ final class AudioLevels {
      */
     private static final long RELEASE_DELAY_MS = 5_000;
     private final Runnable releaseRunnable = () -> {
-        if (viz != null) stop();
+        if (running()) stop();
     };
+
+    private boolean running() {
+        return viz != null || sharedTap != null;
+    }
 
     void setActive(boolean active) {
         if (active == wanted) return;
@@ -54,8 +60,8 @@ final class AudioLevels {
         bg.post(() -> {
             if (active) {
                 bg.removeCallbacks(releaseRunnable);
-                if (viz == null) start();
-            } else if (viz != null) {
+                if (!running()) start();
+            } else if (running()) {
                 bg.removeCallbacks(releaseRunnable);
                 bg.postDelayed(releaseRunnable, RELEASE_DELAY_MS);
             }
@@ -71,6 +77,17 @@ final class AudioLevels {
     }
 
     private void start() {
+        SharedAudioTap.Source shared = SharedAudioTap.source;
+        if (shared != null) {
+            try {
+                sharedTap = shared.open(this::onFft);
+                XLog.d("using the host's shared audio tap");
+                return;
+            } catch (Throwable t) {
+                sharedTap = null;
+                XLog.e("shared audio tap unavailable", t);
+            }
+        }
         if (failedAt != 0 && SystemClock.uptimeMillis() - failedAt < RETRY_MS) return;
         try {
             Visualizer v = new Visualizer(0);
@@ -101,10 +118,20 @@ final class AudioLevels {
     }
 
     private void stop() {
-        try {
-            viz.setEnabled(false);
-            viz.release();
-        } catch (Throwable ignored) {
+        if (sharedTap != null) {
+            SharedAudioTap.Source shared = SharedAudioTap.source;
+            try {
+                if (shared != null) shared.close(sharedTap);
+            } catch (Throwable ignored) {
+            }
+            sharedTap = null;
+        }
+        if (viz != null) {
+            try {
+                viz.setEnabled(false);
+                viz.release();
+            } catch (Throwable ignored) {
+            }
         }
         viz = null;
         for (int i = 0; i < BANDS; i++) levels[i] = 0f;
