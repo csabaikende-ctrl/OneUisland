@@ -32,6 +32,37 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
 
     private static IslandController instance;
 
+    /**
+     * Lets a native host follow the part of the status bar the island covers, in screen
+     * coordinates (the same bounds the status bar icons are faded under), e.g. to keep its own
+     * status bar content out from under the island.
+     */
+    public interface CoverageListener {
+        void onIslandCoverage(RectF bounds, boolean active);
+    }
+
+    private static volatile CoverageListener coverageListener;
+    private final RectF lastCoverage = new RectF();
+    private boolean lastCoverageActive;
+
+    public static void setCoverageListener(CoverageListener listener) {
+        coverageListener = listener;
+    }
+
+    private void reportCoverage(RectF bounds, boolean active) {
+        CoverageListener l = coverageListener;
+        if (l == null) return;
+        if (active == lastCoverageActive && (!active || bounds.equals(lastCoverage))) return;
+        lastCoverageActive = active;
+        if (active) lastCoverage.set(bounds);
+        else lastCoverage.setEmpty();
+        try {
+            l.onIslandCoverage(new RectF(lastCoverage), active);
+        } catch (Throwable t) {
+            XLog.e("coverage listener failed", t);
+        }
+    }
+
     final Context ctx;
     final ClassLoader cl;
     final Handler main = new Handler(Looper.getMainLooper());
@@ -290,6 +321,7 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         v.removeOnLayoutChangeListener(statusBarLayoutListener);
         fader.detach();
         statusBarView = null;
+        reportCoverage(tmp, false);
     }
 
     public void setOngoingActivityController(Object controller) {
@@ -676,7 +708,9 @@ public final class IslandController implements IslandView.Host, IslandWindow.Lis
         window.setShown(true);
         if (!view.shadePulled()) {
             view.getCoverageBounds(tmp);
-            fader.update(tmp, !hidden && view.visibleAlpha() > 0.3f);
+            final boolean covering = !hidden && view.visibleAlpha() > 0.3f;
+            fader.update(tmp, covering);
+            reportCoverage(tmp, covering);
         }
         audio.setActive(media.anyPlaying());
     }
